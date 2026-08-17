@@ -8,12 +8,14 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from pathlib import Path
 
-def getConversionRatios(board_id:str, verbose:bool=False)->dict:
+def getConversionRatios(board_id:str, direction:str="PwrToPwm", verbose:bool=False)->dict:
     """
     Reads the calibration values from the calibration file corresponding to the given board_id.
     Returns a dictionary with the conversion ratios that allow to find a pwm from a pwr input
+    (direction="PwrToPwm", unit pwm/W) or a pwr from a pwm input (direction="PwmToPwr", unit W/pwm)
     for every heater of the frame.
     """
+    assert direction in ("PwrToPwm", "PwmToPwr"), "direction must be either 'PwrToPwm' or 'PwmToPwr'"
     # Open the calibration file
     current_wd = Path(__file__).parent.resolve()
     calib_file = current_wd / f"max_pwm_powers.csv"
@@ -27,7 +29,10 @@ def getConversionRatios(board_id:str, verbose:bool=False)->dict:
     for htr in board_calib_df.columns:
         if htr == "base":
             continue
-        ratio = 950 / board_calib_df.loc[board_id, htr] # Unit is pwm/W
+        if direction == "PwrToPwm":
+            ratio = 950 / board_calib_df.loc[board_id, htr] # Unit is pwm/W
+        else:
+            ratio = board_calib_df.loc[board_id, htr] / 950 # Unit is W/pwm
         ratio_rounded = round(ratio, 4)
         conversion_ratios[htr] = ratio_rounded
 
