@@ -7,6 +7,78 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from pathlib import Path
+from configparser import ConfigParser
+
+HEATER_KEYS = [f"h{i:02d}" for i in range(10)]
+
+
+def _robotCfgFilename(board_id: str) -> str:
+    """New-style per-robot config files use an 'rhc' filename prefix (e.g. RHCConfigs/rhc31.cfg
+    for board_id 'abc31') even though board_id itself keeps its historical 'abc' prefix."""
+    return board_id.replace("abc", "rhc", 1) + ".cfg"
+
+
+def _robotCfgPath(board_id: str) -> Path:
+    return Path(__file__).parent.resolve() / "RHCConfigs" / _robotCfgFilename(board_id)
+
+
+def _readRobotCfg(board_id: str, logger_func=None):
+    """Reads the per-robot config file (RHCConfigs/<rhc-name>.cfg) for the given board_id.
+    Returns None (and warns via logger_func, if given) if no such file exists yet."""
+    cfg_path = _robotCfgPath(board_id)
+    if not cfg_path.exists():
+        if logger_func is not None:
+            logger_func(f"No RHCConfigs file found for board_id {board_id} ({cfg_path}).", level='WRN')
+        return None
+    cfg = ConfigParser()
+    cfg.read(cfg_path)
+    return cfg
+
+
+def writeCalibration(board_id: str, max_htr_powers, base_power: float):
+    """
+    Writes newly computed heater calibration data into the robot's RHCConfigs/<rhc-name>.cfg file,
+    creating the file (and RHCConfigs/ folder) if it doesn't exist yet. Preserves any mcu_uuid /
+    exclude_sensors already recorded for that robot. `max_htr_powers` is indexed by h00..h09 (e.g.
+    the pd.Series returned by findMaxHtrPowers).
+    """
+    cfg_path = _robotCfgPath(board_id)
+    cfg_path.parent.mkdir(exist_ok=True)
+
+    existing = ConfigParser()
+    if cfg_path.exists():
+        existing.read(cfg_path)
+    mcu_uuid = existing.get("Board", "mcu_uuid", fallback="")
+    excl = existing.get("InvalidSensors", "exclude_sensors", fallback="")
+
+    htr_lines = "\n".join(f"{h} = {max_htr_powers[h]}" for h in HEATER_KEYS)
+
+    content = f"""# Per-robot config file for board_id {board_id}.
+# Maintained by RHCCalibration's CalibrationFilesGenerator.ipynb.
+# Do NOT comment on the right side of the equal signs.
+
+[Board]
+board_id = {board_id}
+# The MCU_UUID is acquired through the conversion of the 3 hex values from the MCU to binary; then appending them together and converting the result to decimal.
+# Use compute_MCU_uuid.py to calculate the MCU_UUID from the 3 hex values from the get_mcu_uuid() function.
+mcu_uuid = {mcu_uuid}
+
+[MaxPwmPower]
+# Power (W) at PWM=950 for each heater, and the frame's base power draw (W) at PWM=0.
+# Generated from InfluxDB heater-response loggings, see CalibrationFilesGenerator.ipynb.
+{htr_lines}
+base = {base_power}
+
+[InvalidSensors]
+# To exclude some sensors from being sampled, e.g. if they are not present or not working,
+# enter their indices here separated by space. This will disable the sensors through the fw at init.
+# To ignore t10 and t30, for example, one could put:
+# exclude_sensors = 10 30
+exclude_sensors = {excl}
+"""
+    with open(cfg_path, "w") as f:
+        f.write(content)
+
 
 def getConversionRatios(board_id:str, direction:str="PwrToPwm", verbose:bool=False)->dict:
     """
@@ -16,25 +88,19 @@ def getConversionRatios(board_id:str, direction:str="PwrToPwm", verbose:bool=Fal
     for every heater of the frame.
     """
     assert direction in ("PwrToPwm", "PwmToPwr"), "direction must be either 'PwrToPwm' or 'PwmToPwr'"
-    # Open the calibration file
-    current_wd = Path(__file__).parent.resolve()
-    calib_file = current_wd / f"max_pwm_powers.csv"
-    calib_df = pd.read_csv(calib_file)
-    # Set board_id col as index
-    calib_df.set_index("board_id", inplace=True)
-    board_calib_df = calib_df.loc[board_id, :].to_frame().T
+    cfg = _readRobotCfg(board_id)
+    if cfg is None or not cfg.has_section("MaxPwmPower") or not cfg.get("MaxPwmPower", "h00", fallback=""):
+        raise KeyError(f"No MaxPwmPower calibration data found for board_id {board_id} in RHCConfigs.")
     if verbose:
-        print(f"[D] Calibration data for board_id {board_id}:\n{board_calib_df}")
+        print(f"[D] Calibration data for board_id {board_id}:\n{dict(cfg['MaxPwmPower'])}")
     conversion_ratios = {}
-    for htr in board_calib_df.columns:
-        if htr == "base":
-            continue
+    for htr in HEATER_KEYS:
+        power = cfg.getfloat("MaxPwmPower", htr)
         if direction == "PwrToPwm":
-            ratio = 950 / board_calib_df.loc[board_id, htr] # Unit is pwm/W
+            ratio = 950 / power # Unit is pwm/W
         else:
-            ratio = board_calib_df.loc[board_id, htr] / 950 # Unit is W/pwm
-        ratio_rounded = round(ratio, 4)
-        conversion_ratios[htr] = ratio_rounded
+            ratio = power / 950 # Unit is W/pwm
+        conversion_ratios[htr] = round(ratio, 4)
 
     if verbose:
         print(f"[D] Conversion ratios for board_id {board_id}:\n{conversion_ratios}")
@@ -42,22 +108,26 @@ def getConversionRatios(board_id:str, direction:str="PwrToPwm", verbose:bool=Fal
     return conversion_ratios
 
 def getUUIDFromBoardID(board_id:str, logger_func = None):
-        # Open the mcu_uuid-abc_ids.csv file
-        # get current working directory path
-        current_wd = Path(__file__).parent.resolve()
-        with open(current_wd / "mcu_uuid-abc_ids.csv", "r") as f:
-            lines = f.readlines()
-            for line in lines:
-                if line[0] == "#":
-                    continue    # Skip comments
-                if line.split(",")[0].strip() == board_id:
-                    mcu_uuid = int(line.split(",")[1].strip())
-                    if logger_func is not None:
-                        logger_func(f"Target MCU UUID is: {mcu_uuid}",level='INF')
-                    return mcu_uuid
+    cfg = _readRobotCfg(board_id, logger_func)
+    uuid_str = cfg.get("Board", "mcu_uuid", fallback="") if cfg is not None else ""
+    if uuid_str:
+        mcu_uuid = int(uuid_str)
         if logger_func is not None:
-            logger_func("The board_id in the cfg file does not match any board_id in the mcu_uuid-abc_ids.csv file. Config file serial_id used to connect to the ABC device.", level='WRN')
-        return None
+            logger_func(f"Target MCU UUID is: {mcu_uuid}", level='INF')
+        return mcu_uuid
+    if logger_func is not None:
+        logger_func("The board_id in the cfg file does not match any board_id with a known MCU UUID in RHCConfigs. Config file serial_id used to connect to the ABC device.", level='WRN')
+    return None
+
+def getExcludedSensors(board_id:str, logger_func = None) -> list:
+    """
+    Returns the list of temperature sensor indices to exclude for the given board_id, read from
+    its RHCConfigs/<rhc-name>.cfg file. Empty list if none configured, or if the robot has no
+    RHCConfigs file yet.
+    """
+    cfg = _readRobotCfg(board_id, logger_func)
+    excl_str = cfg.get("InvalidSensors", "exclude_sensors", fallback="") if cfg is not None else ""
+    return [int(s) for s in excl_str.split()] if excl_str else []
 
 def frameBasePower(abc_data:pd.DataFrame):
     """
